@@ -27,6 +27,9 @@
 #include <sys/un.h>
 #include <mysql/mysql.h>
 #include "cjson.h"
+#include "rbtree.h"
+
+#define HOST_LEN 50
 
 typedef enum{
     log,
@@ -50,24 +53,50 @@ int mysql_string( char* str, int size );
 int write_log( log_warn_level level, const char* fmt, ... );
 void get_datetime( int* year, int* month, int* day, int* hour, int* min, int* sec );
 int check_ip( char* ip );
+int connect_mysql();
+int cfg_get_value( const char* file, const char* section, const char* key, char* value );
 
 
 
 int run = 1;
 int bufsize;
 char ip[16];
-char table[50];
+char table[HOST_LEN];
 int port;
+int report_interval = 100;
+int host_map = 1;
+
+typedef struct{
+    char* word;
+    int len;
+    char tail;
+}word_ident;
+
+typedef struct{
+    rbnode _;
+    char host[HOST_LEN];
+    char table[HOST_LEN];
+}map_node;
 
 MYSQL* db;
 MYSQL_STMT* stmt;
 MYSQL_RES* res;
 MYSQL_ROW row;
 
+rbtree hostmap;
+
+int  map_value_cmp( void* value, rbnode* node );
+int  map_node_cmp ( rbnode* node1, rbnode* node2 );
+void map_node_swap( rbnode* node1, rbnode* node2 );
+int split_words( char* src, word_ident words[], int size, int* count );
+
+
+
 int main( int argc, char* argv[] )
 {
     int fd;
     int rc;
+    long rcvcnt = 0;
     char reff[1024];
     char agent[1024];
     char host[100];
@@ -75,12 +104,13 @@ int main( int argc, char* argv[] )
     char buf[10240];
     char sql[10240];
     time_t last;
-    
+    char *ptable;
+    map_node* n;
     int year, month, day, hour, min, sec;
     
     struct pollfd pfd;
     struct sockaddr_in addr;
-    int len;
+    socklen_t addrlen;
     
     cJSON* root;
     cJSON* json_reff;
@@ -102,9 +132,10 @@ int main( int argc, char* argv[] )
     strcpy( log_file, "nginx_log.log" );
     snprintf( cfg_file, sizeof(cfg_file), "%s", argv[1] );
     
-    write_log( log, "nginx log collecter startup.." );
+    write_log( log, "nginx log collector startup.." );
     
-
+    rbtree_init( &hostmap, map_node_cmp, map_value_cmp, map_node_swap );
+    
     
     if( load_config() )
     {
@@ -143,7 +174,7 @@ int main( int argc, char* argv[] )
         if( rc <= 0 )
         {
             time_t now = time( NULL );
-            if( ( now - last ) > 3600 )
+            if( ( now - last ) > 300 )
             {
                 sprintf( sql, "commit;" );
                 mysql_query( db, sql );
@@ -154,9 +185,10 @@ int main( int argc, char* argv[] )
             continue;
         }
         
-        len = sizeof( addr );
+        last = time( NULL );
+        addrlen = sizeof( addr );
         memset( buf, 0, sizeof(buf) );
-        rc = recvfrom( fd, buf, sizeof(buf), 0, (struct sockaddr *)&addr, &len );
+        rc = recvfrom( fd, buf, sizeof(buf), 0, (struct sockaddr *)&addr, &addrlen );
         if( rc <= 0 )
             continue;
         
@@ -179,18 +211,19 @@ int main( int argc, char* argv[] )
         json_bodysize = NULL;
         
         
-        json_addr     = cJSON_GetObjectItem( root, "ra" );
+        json_addr     = cJSON_GetObjectItem( root, "ra"  );
         json_host     = cJSON_GetObjectItem( root, "tag" );
-        json_method   = cJSON_GetObjectItem( root, "me" );
+        json_method   = cJSON_GetObjectItem( root, "me"  );
         json_uri      = cJSON_GetObjectItem( root, "uri" );
-        json_status   = cJSON_GetObjectItem( root, "st" );
+        json_status   = cJSON_GetObjectItem( root, "st"  );
         json_reff     = cJSON_GetObjectItem( root, "ref" );
-        json_agent    = cJSON_GetObjectItem( root, "ua" );
-        json_reqtime  = cJSON_GetObjectItem( root, "rt" );
-        json_bodysize = cJSON_GetObjectItem( root, "bs" );
+        json_agent    = cJSON_GetObjectItem( root, "ua"  );
+        json_reqtime  = cJSON_GetObjectItem( root, "rt"  );
+        json_bodysize = cJSON_GetObjectItem( root, "bs"  );
         
         if( !json_addr || !json_host || !json_method || !json_uri || !json_status || !json_reff || !json_agent || !json_reqtime  || !json_bodysize )
         {
+            write_log( err, "json element missing!" );
             cJSON_Delete( root );
             continue;
         }
@@ -207,13 +240,24 @@ int main( int argc, char* argv[] )
         mysql_string( agent, sizeof(agent) );
         mysql_string( host, sizeof(host) );
         
+        if( host_map )
+        {
+            n = (map_node*)rbtree_find( &hostmap, (void*)host );
+            if( n )
+                ptable = n->table;
+            else
+                ptable = table;
+        }
+        else
+            ptable = table;
+        
         snprintf( sql, sizeof(sql),
         "insert into %s set "
         "access_date = '%d-%02d-%02d', "
         "access_time = '%d-%02d-%02d %02d:%02d:%02d', "
         "host='%s', remote_addr='%s', method='%s', uri='%s', referer='%s', "
         "user_agent='%s', status=%ld, request_time = %f, body_bytes = %ld",
-        table,
+        ptable,
         year, month, day, 
         year, month, day, hour, min, sec,
         host, json_addr->valuestring, json_method->valuestring, uri, reff,
@@ -222,10 +266,13 @@ int main( int argc, char* argv[] )
         cJSON_Delete( root );
         
         //write_log( log, "sql:%s", sql );
-        
+        rcvcnt ++;
+        if( rcvcnt % report_interval == 0 )
+            write_log( log, "received %ld logs..", rcvcnt );
+            
         if( mysql_query( db, sql ) )
         {
-            write_log( err, "insert database failed! err:%s", mysql_error( db ) );
+            write_log( err, "insert database failed! errno:%d, err:%s", mysql_errno(db), mysql_error( db ) );
         }
         
         
@@ -280,11 +327,53 @@ int connect_mysql()
 
 int load_config()
 {
+    char section[20];
     char tmp[100];
+    int multiply = 1;
+    int len;
+    int count;
+    int i;
+    word_ident words[2];
+    int word_cnt;
+    map_node* n;
     
     if( cfg_get_value( cfg_file, "log", "buf_size", tmp ) )
         return -1;
+    len = strlen( tmp );
+    switch( tmp[len-1] )
+    {
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+            multiply = 1;
+            break;
+        
+        case 'k':
+        case 'K':
+            multiply = 1024;
+            tmp[len-1] = 0;
+            break;
+        
+        case 'm':
+        case 'M':
+            multiply = 1024*1024;
+            tmp[len-1] = 0;
+            break;
+        
+        default:
+            return -1;
+        
+    }
+    
     bufsize = atoi( tmp );
+    bufsize = bufsize * multiply;
     
     if( cfg_get_value( cfg_file, "log", "ip", tmp ) )
         return -1;
@@ -301,6 +390,9 @@ int load_config()
         return -1;
     port = atoi( tmp );
     
+    if( cfg_get_value( cfg_file, "log", "report_interval", tmp ) )
+        return -1;
+    report_interval = atoi( tmp );
     
     if( cfg_get_value( cfg_file, "db", "db_host", tmp ) )
         return -1;
@@ -322,6 +414,43 @@ int load_config()
         return -1;
     snprintf( table, sizeof(table), "%s", tmp );
     
+    if( cfg_get_value( cfg_file, "host_map", "count", tmp ) )
+        return 0;
+    count = atoi( tmp );
+    
+    host_map = 1;
+    for( i = 0; i < count; i++ )
+    {
+        sprintf( section, "map%d", i+1 );
+        if( cfg_get_value( cfg_file, "host_map", section, tmp ) )
+            continue;
+        
+        split_words( tmp, words, 2, &word_cnt );
+        
+        words[0].word[words[0].len] = 0;
+        words[1].word[words[1].len] = 0;
+        
+        n = (map_node*)rbtree_find( &hostmap, words[0].word );
+        if( n )
+        {
+            write_log( wrn, "host '%s' already exist int host map list!", words[0].word );
+            continue;
+        }
+        
+        n = malloc( sizeof(map_node) );
+        if( !n )
+        {
+            printf( "malloc failed!\n" );
+            write_log( err, "malloc host map node failed!\n" );
+            return -1;
+        }
+        
+        snprintf( n->host,  HOST_LEN, "%s", words[0].word );
+        snprintf( n->table, HOST_LEN, "%s", words[1].word );
+        
+        rbtree_insert( &hostmap, (rbnode*)n );
+        
+    }
     
     return 0;
 }
@@ -647,3 +776,100 @@ int check_ip( char* ip )
 }
 
 
+
+
+int split_words( char* src, word_ident words[], int size, int* count )
+{
+    int i;
+    int inword = 0;
+    int start;
+    int cnt = 0;
+    int len;
+    if( !src )
+    {
+        *count = 0;
+        return 0;
+    }
+    
+    len = strlen( src );
+    for( i = 0; i < len; i++ )
+    {
+
+        if( isspace( src[i] ) )  //
+        {
+            if( inword ) // come out of word
+            {
+                if( cnt + 1 > size )
+                    return -1;
+                words[cnt].word = src + start;
+                words[cnt].len  = i - start;
+                words[cnt].tail = src[i];
+                cnt++;
+                inword = 0;
+            }
+        }
+        else
+        {
+            if( !inword ) //come in to a word
+            {
+                inword =1;
+                start = i;
+            }
+        }
+        
+    }
+    
+    if( inword )
+    {
+        if( cnt + 1 > size )
+            return -1;
+        words[cnt].word = src + start;
+        words[cnt].len  = i - start;
+        words[cnt].tail = src[i];
+        cnt++;
+    }
+    
+    *count = cnt;
+    return 0;
+}
+
+int  map_value_cmp( void* value, rbnode* node )
+{
+    map_node* n;
+    char* p;
+    
+    p = value;
+    n = (map_node*) node;
+    
+    return strcmp( p, n->host );
+}
+
+int  map_node_cmp ( rbnode* node1, rbnode* node2 )
+{
+    map_node *n1, *n2;
+    n1 = (map_node*) node1;
+    n2 = (map_node*) node2;
+    
+    return strcmp( n1->host, n2->host );
+}
+
+void map_node_swap( rbnode* node1, rbnode* node2 )
+{
+    char host[HOST_LEN];
+    char table[HOST_LEN];
+    
+    map_node *n1, *n2;
+    n1 = (map_node*) node1;
+    n2 = (map_node*) node2;
+    
+    memcpy( host,  n1->host,  HOST_LEN  );
+    memcpy( table, n1->table, HOST_LEN  );
+    
+    memcpy( n1->host,  n2->host,  HOST_LEN );
+    memcpy( n1->table, n2->table, HOST_LEN );
+    
+    memcpy( n2->host,   host, HOST_LEN );
+    memcpy( n2->table, table, HOST_LEN );
+    
+    
+}
