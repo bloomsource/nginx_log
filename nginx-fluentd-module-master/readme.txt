@@ -1,0 +1,1 @@
+the config file must have a unix format.
